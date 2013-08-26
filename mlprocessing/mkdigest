@@ -1,0 +1,207 @@
+#!/usr/local/bin/perl
+#
+# MKDIGEST(1)                   1996                    MKDIGEST(1)
+# 
+# NAME
+#      mkdigest - Create an rfc-compliant digest from an mbox  file
+#      of messages
+# 
+# SYNOPSIS
+#      mkdigest [-r style] [-h file] [-f file] [-t] < mbox > digest
+# 
+# DESCRIPTION
+#      mkdigest accepts an mbox-style file of email messages on its
+#      standard  input and produces a single digest of the messages
+#      on its standard output.  A mbox file is a file of email mes-
+#      sages  separated  by  lines  beginning with the 5 characters
+#      "From ".
+# 
+#      mkdigest does not produce the headers for the digest message
+#      itself  (except for MIME-Version: and Content-Type: if MIME-
+#      style digests are being created).
+# 
+# OPTIONS
+#      -r style
+#           The -r option controls the style of the  digest.  Three
+#           digest  styles are supported: "1153", which conforms to
+#           RFC 1153, LISTSERV-style digests; "934", which conforms
+#           to  RFC  934, the preferred non-MIME digest format; and
+#           "1521",  which  conforms  to   RFC   1521,   the   MIME
+#           multipart/digest  format.   The  default format is 934.
+#           1153 can also be referred to as "l"; 1521 can  also  be
+#           referred to as "m".
+# 
+#      -h file
+#           The -h option  specifies  a  file  to  include  in  the
+#           digest's  prologue.   The  file  is inserted before the
+#           table of contents, if any.
+# 
+#      -f file
+#           The -f option  specifies  a  file  to  include  as  the
+#           digest's epilogue.  The file is inserted after the last
+#           message in the digest.
+# 
+#      -t   The -t option causes mkdigest to  produce  a  table  of
+#           contents  at  the  beginning of the digest, listing the
+#           subject and author of each message.
+# 
+# AUTHOR
+#      Alan Schwartz
+# 
+# SEE ALSO
+#      Internet RFC's 934, 1153, 1521
+# 
+
+require 'getopts.pl';
+
+# If run with no arguments, show usage info
+&usage if -t STDIN;
+
+# Handle command-line args
+&Getopts('h:f:tr:');
+SWITCH: {
+  $style = 934, last SWITCH unless $opt_r;
+  $style = 1153, last SWITCH if $opt_r =~ /^l/i; 
+  $style = 1521, last SWITCH if $opt_r =~ /^m/i; 
+  $style = $opt_r, last SWITCH
+    if ($opt_r == 934 || $opt_r == $1153 || $opt_r == 1521);
+  &usage;
+}
+if ($opt_h) {
+  if (open(HDR,$opt_h)) {
+    @header = <HDR>;
+    close(HDR);
+  } else {
+    warn "Unable to open header file $opt_h, skipping.\n";
+  }
+}
+if ($opt_f) {
+  if (open(FTR,$opt_f)) {
+    @footer = <FTR>;
+    close(FTR);
+  } else {
+    warn "Unable to open footer file $opt_f, skipping.\n";
+  }
+}
+$table_of_contents = $opt_t;
+
+# We've got to read in the entire stdin in order to make
+# the table of contents and to ensure that mime boundaries
+# are unique.
+$boundary = "a", $bcount = 1 if $style == 1521;
+while (<STDIN>) {
+  # See if we're in headers, and snag subject, author if so.
+  $inheader = 1,$msgno++ if !$inheader && /^From /;
+  if ($inheader) {
+    $inheader = 0 if /^$/;
+    chop;
+    if (/^([^:]+): (.*)/) {
+      ($header,$value) = ($1,$2);
+      $header =~ tr/-A-Z/_a-z/;
+      eval "\$$header\[$msgno\] = \$value";
+      die $@ if $@;
+    } elsif (/^\s+(.*)/) {
+      $value = $1;
+      eval "\$$header\[$msgno\] .= \" \$value\"";
+      die $@ if $@;
+    }
+  }
+  if ($style == 1521 && /^$boundary/) {
+    substr($boundary,$bcount,1) = &different(substr($_,$bcount,1));
+    $bcount++;
+  }
+  push(@mbox,$_);
+}
+$nummsgs = $msgno;
+
+# The header of the digest. We'll make some fake headers.
+# RFC1153 specifies the subject header
+# RFC1521 specifies MIME headers.
+# Append the header file
+print "MIME-Version: 1.0\n",
+      "Content-type: multipart/digest; boundary=\"$boundary\"\n"
+  if $style == 1521;
+print "\n";
+print @header;
+
+# Table of contents here
+if ($table_of_contents) {
+  print "Table of Contents:\n\n";
+  for ($i = 1; $i <= $nummsgs; $i++) {
+    printf "   %-40s     %-25s\n",
+	substr($subject[$i],0,40),substr($from[$i],0,25); 
+  }
+  print "\n";
+}
+
+
+# First boundary
+if ($style == 1153) {
+  print "\n","-"x70,"\n\n";
+  $finalboundary = $boundary = "\n------------------------------\n\n";
+} elsif ($style == 934) {
+  $finalboundary = $boundary = "\n------------------------------\n\n";
+  print $boundary;
+} else {
+  $boundary = "--" . $boundary;
+  $finalboundary = $boundary."--\n";
+  $boundary .= "\n";
+  print $boundary;
+}
+
+# Read in the messages and produce the digest
+# We expect each message to begin with an SMTP From: header,
+# followed by RFC822ish headers, a blank line, and a body.
+#
+$msgno = 0; $inheader = 0;
+foreach (@mbox) {
+  if (!$inheader && /^From /) {
+    $inheader = 1;
+    $msgno++;
+    print $boundary if $msgno > 1;
+  } elsif ($inheader && /^$/) {
+    $inheader = 0;
+    # Construct headers in the order required by RFC 1153
+    print "Date: $date[$msgno]\n" if $date[$msgno];
+    print "From: $from[$msgno]\n" if $from[$msgno];
+    print "To: $to[$msgno]\n" if $to[$msgno];
+    print "Cc: $cc[$msgno]\n" if $cc[$msgno];
+    print "Subject: $subject[$msgno]\n" if $subject[$msgno];
+    print "Message-ID: $message_id[$msgno]\n" if $message_id[$msgno];
+    print "Keywords: $keywords[$msgno]\n" if $keywords[$msgno];
+    print "Summary: $summary[$msgno]\n" if $summary[$msgno];
+    print "\n";
+  }
+  next if $inheader;
+  $_ = "- $_" if ($style == 934 && /^-/);
+  print;
+}
+
+print $finalboundary;
+
+# Append the footer file
+# RFC1153 specifies the digest epilogue.
+print @footer;
+
+sub usage {
+print <<EOP;
+Usage: cat mbox | mkdigest [options] > digest
+Options:
+ -h headerfile	File to put at the top of the digest
+ -f footerfile	File to put at the footer of the digest
+ -t			Create table of contents from message subjects/authors
+ -r <rfc#|m|l>	Make digest conform to the appropriate RFC#
+                (1153, 934, or 1521). "m" (MIME) is 1521
+                "l" (LISTSERV) is 1153. 934 is the default
+EOP
+ exit 1;
+}
+
+# Given a character, return any different 7-bit character
+# Simply return "A" if it's a lowercase letter and "a" if not.
+sub different {
+  local($char) = $_[0];
+  return "A" if ($char =~ /[a-z]/);
+  return "a";
+}
+

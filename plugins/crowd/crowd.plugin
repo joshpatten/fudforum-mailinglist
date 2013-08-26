@@ -1,0 +1,315 @@
+<?php
+/**
+* $Id: crowd.plugin 5615 2013-06-27 16:19:28Z naudefj $
+*
+* This program is free software; you can redistribute it and/or modify it
+* under the terms of the GNU General Public License as published by the
+* Free Software Foundation; version 2 of the License.
+**/
+
+// Some Classes
+class caPasswordCredential {
+        /**
+         * @var string
+         */
+        public $credential;
+}
+
+class caAuthenticatedToken {
+}
+
+class caPrincipal {
+}
+
+class caSearchRestriction {
+}
+
+class caSOAPGroup {
+}
+
+class caSOAPAttribute {
+
+        /**
+         * @var string
+         */
+        public $name;
+
+        /**
+         * @var array
+         */
+        public $values;
+
+        /**
+         * @param $name string
+         * @param $value string
+         */
+        public function __construct( $name, $value ) {
+                $this->name = $name;
+                $this->values = array( $value );
+        }
+}
+
+class caApplicationAuthenticationContext {
+        /**
+         * @var PasswordCredential
+         */
+        public $credential;
+
+        /**
+         * @var string
+         */
+        public $name;
+
+        /**
+         * @var array
+         */
+        public $validationFactors = null;
+}
+
+class caPrincipalAuthenticationContext {
+        public $application;
+
+        /**
+         * @var PasswordCredential
+         */
+        public $credential;
+
+        /**
+         * @var string
+         */
+        public $name;
+
+        /**
+         * @var array
+         */
+        public $validationFactors = null;
+}
+
+
+// Initialize me as an authentication plugin if Crowd extension is loaded.
+plugin_add_hook('AUTHENTICATE', 'plugin_crowd_auth');
+
+// Authenticate users from LDAP directory.
+function plugin_crowd_auth() {
+	$login    = $_POST['login'];
+	$password = $_POST['password'];
+
+	if ($login == 'admin') {	// Always allow admin through.
+		return 1;
+	}
+
+	if ((@include_once $GLOBALS['PLUGIN_PATH'] .'crowd/crowd.ini') === false) {
+		echo 'ERROR: Please configure the Crowd plugin from the Plugin Manager Control panel.';
+		return 0;
+	}
+	// Connect to Crowd Server and get SOAP WSDL
+	try {
+		$crowd = @new SoapClient($ini['CROWD_SERVER_URL'] .'/SecurityServer?wsdl',
+			array( 'classmap' =>
+				array(
+					'ApplicationAuthenticationContext' => 'caApplicationAuthenticationContext',
+					'PrincipalAuthenticationContext' => 'caPrincipalAuthenticationContext',
+					'PasswordCredential' => 'caPasswordCredential',
+					'AuthenticatedToken' => 'caAuthenticatedToken',
+					'SOAPPrincipal' => 'caPrincipal',
+					'SOAPAttribute' => 'caSOAPAttribute',
+					'SearchRestriction' => 'caSearchRestriction',
+					'SOAPGroup' => 'caSOAPGroup',
+				)
+			)	
+		);
+	} catch ( Exception $e ) {
+		echo 'Unable to connect to Crowd server. Contact the forum administrator! Error information: ' . $e . ' (Debug 1)';
+		return 0;
+	}
+	
+	// Authenticate to Crowd server with application credentials
+	try {
+		$cred = new caPasswordCredential();
+		$cred->credential = $ini['CROWD_APPLICATION_PASSWORD'];
+		$authctx = new caApplicationAuthenticationContext();
+		$authctx->credential = $cred;
+		$authctx->name = $ini['CROWD_APPLICATION_NAME'];
+		$t = $crowd->authenticateApplication( array( "in0" => $authctx ) );
+		$token = $t->out;
+	} catch ( Exception $e ) {
+		echo 'Crowd application name and/or password incorrect. Contact the forum administrator! Error information: ' . $e . ' (Debug 1)';
+		return 0;
+	}
+	
+	// Search for the user. This also pulls in user attributes
+	try {
+		$search = $crowd->findPrincipalWithAttributesByName( array ( "in0" => $token, "in1" => $login ) );
+		$status = $search->out->active;
+		$validuser = $search->out->name;
+	} catch ( Exception $e ) {
+		//echo 'Unknown username. Please try to login again. (Debug 4)';
+		return 0;
+	}
+	if ( $status != 1 ) {
+		//echo 'User account inactive. Please try a different username. (Debug 4)';
+		return 0;
+	}
+	
+	// Set some null values, will be used later if needed
+	$avatarurl = null;
+	$jobtitle = null;
+	// Collect user attributes from search query
+	$attributes = $search->out->attributes->SOAPAttribute;
+	foreach ( $attributes as $attr ) {
+		if ($attr->name == 'displayName' ) {
+			$realname = $attr->values->string;
+		}
+		if ( $attr->name == 'mail' ) {
+			$emailaddr = $attr->values->string;
+		}
+		//Collect additional info if available
+		if ( $attr->name == 'userinfo' ) {
+			if (count($attr->values->string) == 1) {
+				$info = str_replace("{", "", $attr->values->string);
+				$info = str_replace("}", "", $info);
+				$info = str_replace('"', "", $info);
+				$info = explode(":", $info);
+				$info[0] = trim($info[0]);
+				$info[1] = trim($info[1]);
+				if ( $info[0] == "job_title" ) {
+					$jobtitle = $info[1];
+				}
+				if ( $info[0] == "portraitId" ) {
+					$avatarurl = $ini['CROWD_AVATAR_URL'] . strval($info[1]);
+				}
+			} else {
+				foreach ( $attr->values->string as $info ) {
+					print_r($info);
+					$info = str_replace("{", "", $info);
+					$info = str_replace("}", "", $info);
+					$info = str_replace('"', "", $info);
+					$info = explode(":", $info);
+					$info[0] = trim($info[0]);
+					$info[1] = trim($info[1]);
+					if ( $info[0] == "job_title" ) {
+						$jobtitle = $info[1];
+					}
+					if ( $info[0] == "portraitId" ) {
+						$avatarurl = $ini['CROWD_AVATAR_URL'] . strval($info[1]);
+					}
+				}
+			}
+		}
+	}
+	// Now, try to login with their username and password.
+	
+	try {
+		$crowdlogin = new caPasswordCredential();
+		$crowdlogin->credential = $password;
+		$authcrowd = new caPrincipalAuthenticationContext();
+		$authcrowd->name = $login;
+		$authcrowd->credential = $crowdlogin;
+		$authcrowd->application = $ini['CROWD_APPLICATION_NAME'];
+		$userauth = $crowd->authenticatePrincipal( array( "in0" => $token, "in1" => $authcrowd ) );
+		$usertoken = $userauth->out;
+	} catch ( Exception $e ) {
+		echo 'Incorrect username and/or password. Please try to login again. (Debug 4)';
+		return 0;
+	}
+
+	if ($login == $validuser) {
+
+		if (!($usr_d = db_sab('SELECT id, users_opt FROM '. $GLOBALS['DBHOST_TBL_PREFIX'] .'users WHERE login='. _esc($login)))) {
+			// Register new FUDforum user.
+			$avatarstring = null;
+			if (is_null($avatarurl) == false) {
+				$avatarloc = $GLOBALS['WWW_ROOT_DISK'] . '/images/custom_avatars/' . $usr_d->id . '.jpg';
+				file_put_contents($avatarloc, fopen($avatarurl, 'r'));
+				$avatarsize = getimagesize($avatarloc);
+				$avatarstring = '<img src="' . $GLOBALS['WWW_ROOT'] . 'images/custom_avatars/' . $usr_d->id . '.jpg" alt="" ' . $avatarsize[3] . ' />';
+			}
+			$uent = new fud_user_reg;
+			$uent->login = $login;
+			$uent->plaintext_passwd = $password;
+			$uent->email = $emailaddr;
+			$uent->name = $realname;
+			$uent->occupation = $jobtitle;
+			$uent->avatar_loc = $avatarstring;
+			if (is_null($avatarstring)) {
+				$uent->users_opt = 4357012;
+			} else {
+				$uent->users_opt = 8551316;
+			}
+			$uent->add_user();
+		} else {
+			// Sync password, avatar, job title, email, and real name every time, in case it is changed in Crowd
+			
+			if (is_null($avatarurl) == false) {
+				$avatarloc = $GLOBALS['WWW_ROOT_DISK'] . '/images/custom_avatars/' . $usr_d->id . '.jpg';
+				file_put_contents($avatarloc, fopen($avatarurl, 'r'));
+				$avatarsize = getimagesize($avatarloc);
+				$avatarstring = '<img src="' . $GLOBALS['WWW_ROOT'] . 'images/custom_avatars/' . $usr_d->id . '.jpg" alt="" ' . $avatarsize[3] . ' />';
+				q('UPDATE ' . $GLOBALS['DBHOST_TBL_PREFIX'] . 'users SET avatar_loc=' . _esc($avatarstring) . ' WHERE login=' . _esc($login));
+				if ($usr_d->users_opt == 4357012) {
+					q('UPDATE ' . $GLOBALS['DBHOST_TBL_PREFIX'] . 'users SET users_opt=8551316 WHERE login=' . _esc($login));
+				} else if ($usr_d->users_opt == 5405588) {
+					q('UPDATE ' . $GLOBALS['DBHOST_TBL_PREFIX'] . 'users SET users_opt=9599892 WHERE login=' . _esc($login));
+				}
+			}
+			$salt = substr(md5(uniqid(mt_rand(), true)), 0, 9);
+			$sec_pass = sha1($salt . sha1($password));
+			q('UPDATE ' . $GLOBALS['DBHOST_TBL_PREFIX'] . 'users SET passwd='. _esc($sec_pass) . ', salt=' . _esc($salt) . ' WHERE id=' . $usr_d->id);
+			q('UPDATE ' . $GLOBALS['DBHOST_TBL_PREFIX'] . 'users SET email=' . _esc($emailaddr) . ' WHERE login=' . _esc($login));
+			q('UPDATE ' . $GLOBALS['DBHOST_TBL_PREFIX'] . 'users SET name=' . _esc($realname) . ' WHERE login=' . _esc($login));
+			q('UPDATE ' . $GLOBALS['DBHOST_TBL_PREFIX'] . 'users SET occupation=' . _esc($jobtitle) . ' WHERE login=' . _esc($login));
+		}
+		return 1;	// Allow access.
+	} else {
+		return 0;	// Deny access.
+	}
+
+}
+
+function crowd_info() {
+	return array('name' => 'Atlassian Crowd Authentication',
+	             'desc' => 'Authenticate forum users from an Atlassian Crowd server. You may want to disable "<i>Allow Registration</i>" from the <i>Global Settings Manager</i> after enabling this plugin.',
+		     'cat'  => 'Authentication',
+		     'version' => '1.0');
+}
+
+function crowd_enable() {
+	if (!extension_loaded('soap')) {
+		return array(null, 'You PHP installation doesn\'t support SOAP. Please install PHP Soap module.');	// OK, Err.
+	}
+	return;	// Good to go.
+}
+
+function crowd_config() {
+	if((@include $GLOBALS['PLUGIN_PATH'] .'crowd/crowd.ini') === false) {
+		$ini = NULL;
+	}
+
+	if (isset($_POST['Set'])) {
+		foreach (array_keys($_POST) as $key) {
+			if (substr($key,0,6) == 'CROWD_') {
+				$ini[$key] = $_POST[$key];
+			}
+		}
+
+		$fp = fopen($GLOBALS['PLUGIN_PATH'] .'crowd/crowd.ini', 'w');
+		fwrite($fp, '<?php $ini = '. var_export($ini, 1) .'; ?>');
+		fclose($fp);
+		pf(successify('Settings successfully saved.'));
+	}
+	?>
+<p>URL of Crowd Server (Example: http://localhost:8095/crowd/services):<br />
+<input name="CROWD_SERVER_URL" value="<?php echo $ini['CROWD_SERVER_URL'] ?>" /></p>
+
+<p>Crowd Application Name:<br />
+<input name="CROWD_APPLICATION_NAME" value="<?php echo $ini['CROWD_APPLICATION_NAME'] ?>" /></p>
+
+<p>Crowd Application Password:<br />
+<input name="CROWD_APPLICATION_PASSWORD" value="<?php echo $ini['CROWD_APPLICATION_PASSWORD'] ?>" /></p>
+
+<p>Crowd Avatar URL prefix:<br />
+<input name="CROWD_AVATAR_URL" value="<?php echo $ini['CROWD_AVATAR_URL'] ?>" /></p>
+	<?php
+}
+
+?>

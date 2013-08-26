@@ -1,0 +1,167 @@
+#!/usr/bin/php
+<?php
+
+function userQuery($host, $user, $passwd, $dbname, $table, $email) {
+	errorReport("Opening link to MySQL database...\n");
+	$mylink = mysql_connect($host, $user, $passwd)
+		or die(errorReport("Could not connect: " . mysql_error() . "\n"));
+	errorReport("Link created to MySQL.\n");
+	mysql_select_db($dbname) or die(errorReport("Could not select database"));
+	errorReport("Switched to database " . $dbname . "\n");
+	$query = 'SELECT name, email, custom_fields FROM ' . $table . ' WHERE email="' . $email . '"';
+	errorReport("performing query\n");
+	$result = mysql_query($query) or die(errorReport("Query failed: " . mysql_error() . "\n"));
+	$queryarray = array();
+	while ($line = mysql_fetch_array($result, MYSQL_ASSOC)) {
+		$queryarray[] = $line;
+	}
+	errorReport("Closing link to MySQL database.\n");
+	mysql_close($mylink);
+	errorReport("Returning results.\n");
+	return $queryarray;
+}
+
+function errorReport($string) {
+	error_log(date(DATE_RFC822) . ": " . $string, 3, "/var/log/mlist/incoming.log");
+}
+
+function mlQuery($host, $user, $passwd, $dbname, $table, $mladdr) {
+    errorReport("Opening link to MySQL database...\n");
+	$mylink = mysql_connect($host, $user, $passwd)
+		or die('Could not connect: ' . mysql_error());
+	errorReport("Link created to MySQL.\n");
+	mysql_select_db($dbname) or die('Could not select database');
+	errorReport("Switched to database " . $dbname . "\n");
+	$query = 'SELECT id, forum_id, name, subject_regex_haystack FROM ' . $table . ' WHERE name="' . $mladdr . '"';
+	errorReport("performing query\n");
+	$result = mysql_query($query) or die('Query failed: ' . mysql_error());
+	$queryarray = array();
+	while ($line = mysql_fetch_array($result, MYSQL_ASSOC)) {
+		$queryarray[] = $line;
+	}
+	errorReport("Closing link to MySQL database.\n");
+	mysql_close($mylink);
+	errorReport("Returning results.\n");
+	return $queryarray;
+}
+
+function getReceivedInfo($emailarr) {
+	foreach($emailarr as $line) {
+		if (preg_match("/Received: from .* \(.*\[.*\]\)/", $line)) {
+			$matcher = preg_match("/Received: from (.*) \((.*)\[(.*)\]\)/", $line, $match);;
+			return $match;
+		}
+	}
+}
+	
+include	'/usr/local/bin/mailinglists-settings.php';
+
+//Postfix sends to STDIN
+$fd = fopen("php://stdin", 'r');
+$email = array();
+//Read entire email from STDIN
+while ( $line = fgets($fd) ) {
+        $email[] = $line;
+}
+//Tidy Up
+fclose($fd);
+errorReport("Finished reading mail from stdin\n");	
+
+//Get from and to addresses from argv
+$i = 0;
+foreach ($argv as $arg) {
+        if ($i == 1) {
+                $fromaddress = $arg;
+        } else if ($i == 2) {
+                $toaddress = $arg;
+        }
+        $i++;
+}
+errorReport("From: address is " . $fromaddress . "\n");
+errorReport("To: address is " . $toaddress . "\n");
+$senderinfo = getReceivedInfo($email);
+//Run Python SPF/MX checker
+//If SPF records don't exist for sender, check MX records.
+$spfpass = array();
+exec('/usr/local/bin/spfcheck ' . $senderinfo[3] . ' ' . $fromaddress . ' ' . $senderinfo[1], $spfpass);
+//If message not from valid SPF or valid MX record/IP, Abort
+if (trim($spfpass[0]) != "pass") {
+	die(errorReport("SPF and/or MX check indicated invalid sending server. Aborting...\n"));
+}
+errorReport("SPF passed\n");
+//Check if From: email address exists in users database
+errorReport("Verifying email is from user in FUDforum database\n");
+$queryarray = userQuery($mysql_host, $mysql_username, $mysql_passwd, $mysql_dbname, $mysql_users_table, trim($fromaddress));
+if ($queryarray == null) {
+	die("Email address " . $fromaddress . " not found in database. Aborting...\n");
+}
+$dbemailaddr = $queryarray[0]['email'];
+if (trim($fromaddress) == trim($queryarray[0]['email'])) {
+	errorReport("Email exists in database.\n");
+} else {
+	die(errorReport("Email address " . $fromaddress . " not found in database. Aborting...\n"));
+}
+
+//Get mailing list ID (returns array with ML info)
+errorReport("Getting mailing list ID\n");
+$mlinfo = mlQuery($mysql_host, $mysql_username, $mysql_passwd, $mysql_dbname, $mysql_ml_table, $toaddress);
+if ($mlinfo == null) {
+	die("Error: address " . $toaddress . " is not a valid mailing list address. Aborting...\n");
+}
+$mlidnum = $mlinfo[0]['id'];
+errorReport("Mailing list ID is " . $mlinfo[0]['id'] . "\n");
+
+errorReport("All checks pass, sending mail to forums.\n");
+
+/*
+errorReport("Creating test message file\n");
+$fo = fopen("/tmp/inmail" . time() . ".msg", 'w');
+foreach ($email as $line) {
+                fwrite($fo, $line);
+        }
+fclose($fo);
+*/
+//Setup for talking to sendmail
+errorReport("Setting up to post to mailing list\n");
+$descriptorspec = array(
+   0 => array("pipe", "r"),  // stdin is a pipe that the child will read from
+   1 => array("pipe", "w"),  // stdout is a pipe that the child will write to
+   2 => array("file", "/var/log/mlist/incoming.log", "a") // stderr is a file to write to
+);
+//Command to pipe email stdin to for forum mailing list
+$mlistcmd = '/usr/bin/php /var/www/FUDforum/scripts/maillist.php ' . $mlinfo[0]['id'] . ' | logger';
+errorReport("Running command " . $mlistcmd . "\n");
+//Send to mailing list
+errorReport("Sending to mailing list\n");
+$process = proc_open($mlistcmd, $descriptorspec, $pipes);
+if (is_resource($process)) {
+        errorReport("Process active\n");
+		foreach ($email as $line) {
+                fwrite($pipes[0], $line);
+        }
+        fclose($pipes[0]);
+        $stream = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        proc_close($process);
+}
+errorReport("Sending back out to list\n");
+
+$mlistcmd = '/usr/bin/php /usr/local/bin/remail.php';
+errorReport("Running command " . $mlistcmd . "\n");
+//Send to mailing list
+errorReport("Sending back out to to mailing list\n");
+$process = proc_open($mlistcmd, $descriptorspec, $pipes);
+if (is_resource($process)) {
+        errorReport("Process active\n");
+		foreach ($email as $line) {
+                fwrite($pipes[0], $line);
+        }
+        fclose($pipes[0]);
+        $stream = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        proc_close($process);
+}
+errorReport("Mailing list send complete\n");
+errorReport("----------------------------------------------------------------\n");
+
+?>

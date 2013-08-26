@@ -1,0 +1,24 @@
+#!/usr/bin/python
+import spf
+import sys
+import dns.resolver
+
+valid = spf.check2(sys.argv[1], sys.argv[2], sys.argv[3])
+if valid[0] == "pass":
+	print valid[0]
+elif (valid[0] == "fail") or (valid[0] == "softfail"):
+	print "fail"
+elif (valid[0] == "none") or (valid[0] == "neutral"):
+	mxtrue = "fail"
+	domain = sys.argv[2].split('@')
+	mxrecords = []
+	mxanswer = dns.resolver.query(domain[1], 'MX')
+	for rdata in mxanswer:
+		mxrecords.append(rdata.exchange.to_text())
+	for record in mxrecords:
+		aanswer = dns.resolver.query(record, 'A')
+		for rdata in aanswer:
+			arecord = rdata.address
+		if (record == sys.argv[3] + '.') and (arecord == sys.argv[1]):
+			mxtrue = "pass"
+	print mxtrue
